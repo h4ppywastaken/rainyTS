@@ -1,0 +1,53 @@
+name: Build & Release .rmskin
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from TS6Skin.ini
+        id: get-version
+        run: |
+          VER=$(grep -oP '^Version=\K.+' TS6Skin.ini)
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare package structure
+        run: |
+          mkdir -p _package/Skins/rainyTS
+          cp -r @Resources TS6Skin.ini Start-rainyTS.cmd README.md _package/Skins/rainyTS/
+          cat > _package/RMSKIN.ini <<EOF
+          [rmskin]
+          Name=rainyTS
+          Author=HappuMain
+          Version=${{ steps.get-version.outputs.version }}
+          LoadType=Skin
+          Load=rainyTS\TS6Skin.ini
+          MinimumRainmeter=4.3
+          EOF
+
+      - name: Build .rmskin package
+        id: builder
+        uses: 2bndy5/rmskin-action@v2.0.4
+        with:
+          path: _package
+          dir-out: .
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.get-version.outputs.version }}
+          name: v${{ steps.get-version.outputs.version }}
+          body: |
+            Automated release from commit ${{ github.sha }}
+          files: ${{ steps.builder.outputs.arc-name }}
