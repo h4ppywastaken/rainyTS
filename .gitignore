@@ -1,5 +1,6 @@
 # Runtime data files (auto-generated, must not be committed)
 @Resources/TS6Data.txt
+@Resources/TS6Data.txt.tmp
 @Resources/TS6ApiKey.clixml
 @Resources/TS6ApiKey.txt
 @Resources/TS6Client.pid
