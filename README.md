@@ -16,12 +16,14 @@ It connects securely via the TS6 Remote Apps WebSocket API and features automati
 
 ## Key Features
 
-- **Live TS6 Speaker Status:** Real-time visual feedback tracking who is actively talking.
-- **Voice Channel Monitor:** Displays current active channel name and total connected user list.
-- **Status Indicator Icons:** Dynamic tags for microphone and audio status &emsp; ![talking](https://img.shields.io/badge/talking-brightgreen) &nbsp; ![idle](https://img.shields.io/badge/idle-grey) &nbsp; ![mic--muted](https://img.shields.io/badge/mic--muted-yellow) &nbsp; ![fully%20muted](https://img.shields.io/badge/fully%20muted-red).
+- **Live TS6 Speaker Status:** Users who are talking light up with a green avatar, ring and row highlight.
+- **Voice Channel Monitor:** Shows your current channel name, a user count and everyone in the channel, each with an initial avatar. Your own name is shown in semibold.
+- **Status Indicators:** &emsp; ![talking](https://img.shields.io/badge/talking-34D378) &nbsp; ![idle](https://img.shields.io/badge/idle-grey) &nbsp; ![mic--muted](https://img.shields.io/badge/mic--muted-F5B43C) &nbsp; ![fully%20muted](https://img.shields.io/badge/fully%20muted-F05A5A) &nbsp; Muted users are dimmed and get a mic or speaker icon.
 - **Multi-Server Support:** Automatically shifts focus to display the TS6 channel you spoke in last.
 - **Smart Auto-Hide:** The desktop widget automatically hides itself when disconnected from TeamSpeak.
-- **Dynamic UI Height:** Interface automatically expands or shrinks based on the number of users in the channel (supports up to 24 simultaneous users).
+- **Dynamic UI Height:** The card grows and shrinks with the number of users in the channel (up to 24).
+- **Self-Healing Back-end:** The connection script restarts automatically if it ever exits.
+- **Themeable:** Every color, size and font lives in one settings file (right-click the skin > **Edit settings**).
 
 ---
 
@@ -34,6 +36,7 @@ Before setting up the TeamSpeak 6 overlay, ensure your system has the following 
 | [Rainmeter](https://www.rainmeter.net/)  | `4.5+` | The open-source desktop widget customization engine |
 | [PowerShell](https://learn.microsoft.com/en-us/powershell/)  | `7+ (pwsh)` | Required back-end environment for skin execution |
 | [TeamSpeak 6](https://www.teamspeak.com/) | Client App | Must support and have the **Remote Apps** feature enabled |
+| Windows | 11 (or 10) | Status icons use the *Segoe Fluent Icons* font that ships with Windows 11; on Windows 10 see [UI Customization](#ui-customization--configuration) |
 
 ---
 
@@ -67,18 +70,32 @@ Before setting up the TeamSpeak 6 overlay, ensure your system has the following 
 
 ## UI Customization & Configuration
 
-You can fully customize layout limits, HEX color codes, and connection variables by editing the configuration file located at `@Resources\Settings.inc`:
+You can customize connection settings, colors (`R,G,B,A`), layout and fonts by editing `@Resources\Settings.inc` (or right-click the skin > **Edit settings**), then refreshing the skin:
 
 ```ini
-TS6_Host=127.0.0.1     ; TeamSpeak Remote Apps local host
-TS6_Port=5899          ; Default Remote Apps WebSocket port
-MaxUsers=24            ; Maximum visible user capacity for the widget UI
+; TeamSpeak Remote Apps host and WebSocket port
+TS6_Host=127.0.0.1
+TS6_Port=5899
 
-ColorBG=20,20,20,200   ; RGB background overlay transparency
-ColorTalk=0,230,80,255 ; Active speaking user indicator color
-ColorIdle=80,80,80,255 ; Idle client text color
-..., etc.
+; Card background gradient (top / bottom) and channel accent color
+ColorBGTop=32,34,41,246
+ColorBGBottom=21,22,27,246
+ColorAccent=110,168,255,255
+
+; Status colors: talking, mic muted, fully muted
+ColorTalk=52,211,120,255
+ColorMicMute=245,180,60,255
+ColorFullMute=240,90,90,255
+
+; Card width, row height and avatar size (px)
+SkinWidth=240
+LineHeight=26
+AvatarSize=20
 ```
+
+The status icons use **Segoe Fluent Icons** (Windows 11). On Windows 10, set `IconFont=Segoe MDL2 Assets`.
+
+> Rainmeter only supports comments on their own line; don't put `;` comments after a value.
 
 ---
 
@@ -93,7 +110,7 @@ This TeamSpeak widget relies on a multi-tier script framework to ensure low CPU 
 
 2. **Lua Controller Script** (`@Resources\Script.lua`)
    - Ticks on a 250 ms Rainmeter update cycle to read `TS6Data.txt`.
-   - Modifies UI elements on-the-fly and triggers the auto-hide state when connection drops.
+   - Only redraws the rows whose content changed, and triggers the auto-hide state when the connection drops.
 
 3. **Data Buffer Interface** (`TS6Data.txt`)
    ```text
@@ -112,7 +129,9 @@ If the voice overlay is not displaying active channel data, you can debug the We
 ```cmd
 Start-rainyTS.cmd
 ```
-This execution script spins up a dedicated terminal window displaying real-time stream logs from the TeamSpeak Remote Apps API.
+This execution script spins up a dedicated terminal window displaying real-time stream logs from the TeamSpeak Remote Apps API. While it is open, the skin's own back-end waits in the background and takes over again once you close the console.
+
+The skin connects to `TS6_Host` / `TS6_Port` from `Settings.inc`; `Start-rainyTS.cmd` always uses the defaults (`127.0.0.1:5899`).
 
 ---
 
