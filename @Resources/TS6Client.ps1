@@ -1,6 +1,10 @@
 ﻿param(
     [string]$HostAddr = "127.0.0.1",
-    [int]$Port = 5899
+    [int]$Port = 5899,
+    # Set when launched by the Rainmeter skin. Suppresses console logging
+    # (RunCommand keeps all output in memory for the lifetime of the
+    # process) and marks this instance as skin-owned in the PID file.
+    [switch]$Quiet
 )
 
 # Load the WebSocket assembly if available.
@@ -45,8 +49,23 @@ function Get-PropsMuteStatus {
     return @{ im = $im; om = $om }
 }
 
+# Look up the last known mute flags (0/1) of a client from the per-connection cache.
+function Get-CachedMuteFlags {
+    param($ConnId, $Cid)
+    $im = 0; $om = 0
+    if ($ConnId -and $script:connectionsCache.ContainsKey($ConnId)) {
+        $infos = $script:connectionsCache[$ConnId].clientInfos
+        if ($infos.ContainsKey($Cid)) {
+            if ($infos[$Cid].inputMuted -eq 1)  { $im = 1 }
+            if ($infos[$Cid].outputMuted -eq 1) { $om = 1 }
+        }
+    }
+    return @{ im = $im; om = $om }
+}
+
 function Write-Log {
     param([string]$M)
+    if ($Quiet) { return }
     Write-Host "$(Get-Date -Format HH:mm:ss) $M"
 }
 
@@ -60,19 +79,41 @@ $legacyKeyFile  = Join-Path $scriptDir "TS6ApiKey.txt"
 $pidFile        = Join-Path $scriptDir "TS6Client.pid"
 
 # Ensure at most one rainyTS script runs at a time.
-if (Test-Path $pidFile) {
+# PID file format: "<pid>|skin" or "<pid>|standalone" (a bare "<pid>" from
+# older versions is treated as skin-owned).
+#  - A new instance normally replaces the old one.
+#  - Exception: a skin-launched instance never kills a stand-alone debug
+#    instance (Start-rainyTS.cmd). It waits for it to exit and then takes
+#    over; otherwise the skin's auto-restart would keep killing the console.
+function Get-RunningOwner {
+    if (-not (Test-Path $pidFile)) { return $null }
     try {
-        $oldPid = (Get-Content $pidFile -Raw).Trim()
-        if ($oldPid -match '^\d+$' -and [int]$oldPid -ne $PID) {
-            $proc = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
-            if ($proc -and $proc.ProcessName -match 'powershell|pwsh') {
-                Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Milliseconds 500
-            }
+        $raw = (Get-Content $pidFile -Raw).Trim()
+        if ($raw -notmatch '^(\d+)(?:\|(\w+))?$') { return $null }
+        $oldPid = [int]$Matches[1]
+        $mode   = if ($Matches[2]) { $Matches[2] } else { 'skin' }
+        if ($oldPid -eq $PID) { return $null }
+        $proc = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
+        if ($proc -and $proc.ProcessName -match 'powershell|pwsh') {
+            return @{ pid = $oldPid; mode = $mode }
         }
     } catch { }
+    return $null
 }
-try { [System.IO.File]::WriteAllText($pidFile, $PID.ToString()) } catch { }
+
+$owner = Get-RunningOwner
+if ($Quiet) {
+    while ($owner -and $owner.mode -eq 'standalone') {
+        Start-Sleep -Seconds 2
+        $owner = Get-RunningOwner
+    }
+}
+if ($owner) {
+    Stop-Process -Id $owner.pid -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+}
+$instanceMode = if ($Quiet) { 'skin' } else { 'standalone' }
+try { [System.IO.File]::WriteAllText($pidFile, "$PID|$instanceMode") } catch { }
 
 
 # ==================== TS6 app identity ====================
@@ -108,9 +149,9 @@ function Read-Key {
     if (Test-Path $keyFile) {
         try {
             $cred = Import-Clixml $keyFile
-            $pwd = $cred.GetNetworkCredential().Password
-            Write-Log "Key read from clixml, len=$($pwd.Length)"
-            return $pwd
+            $key = $cred.GetNetworkCredential().Password
+            Write-Log "Key read from clixml, len=$($key.Length)"
+            return $key
         } catch { Write-Log "Key clixml failed: $_" }
     }
     # Fall back to the legacy plain-text file, then migrate it.
@@ -139,6 +180,25 @@ function Write-Key {
 
 # ==================== Data file writer ====================
 
+# Write the data file atomically (temp file + rename) so the Lua side,
+# which polls every 250 ms, never reads a half-written file.
+function Set-DataFileContent {
+    param([string]$Content)
+    $enc = New-Object System.Text.UTF8Encoding $false
+    $tmp = "$dataFile.tmp"
+    try {
+        [System.IO.File]::WriteAllText($tmp, $Content, $enc)
+        [System.IO.File]::Move($tmp, $dataFile, $true)
+    } catch {
+        try { [System.IO.File]::WriteAllText($dataFile, $Content, $enc) } catch { }
+        try { Remove-Item $tmp -ErrorAction SilentlyContinue } catch { }
+    }
+}
+
+function Write-RefreshSignal {
+    Set-DataFileContent "REFRESH|0`n"
+}
+
 function Write-DataFile {
     # If a pendingRefresh flag is set, don't write — the REFRESH signal
     # from the previous event must be preserved until Lua reads it.
@@ -153,16 +213,13 @@ function Write-DataFile {
         [void]$lines.Add("$($e.Key)|$($e.Value.n)|$($e.Value.t)|$isLocal|$im|$om")
     }
     $chan = if ($script:channelName) { $script:channelName } else { "?" }
-    $content = "$chan|$($lines.Count)`n$($lines -join "`n")"
-    try { $content | Out-File $dataFile -Encoding utf8NoBOM } catch { }
-    $script:prevState = $content
+    $content = "$chan|$($lines.Count)`n$($lines -join "`n")`n"
+    Set-DataFileContent $content
 }
 
 function Write-DisconnectedState {
     if ($script:pendingRefresh) { return }
-    $content = "DISCONNECTED|0`n"
-    try { $content | Out-File $dataFile -Encoding utf8NoBOM } catch { }
-    $script:prevState = $content
+    Set-DataFileContent "DISCONNECTED|0`n"
 }
 
 
@@ -210,16 +267,19 @@ function Read-WS-Msg {
         if ($task.Status -ne [System.Threading.Tasks.TaskStatus]::RanToCompletion) { return $null }
         $r = $task.Result
         if ($r.MessageType -eq [System.Net.WebSockets.WebSocketMessageType]::Close) { return $null }
-        $text = [System.Text.Encoding]::UTF8.GetString($buff, 0, $r.Count)
-        # Handle multi-frame messages (EndOfMessage is false for partial frames).
+        # Collect all frames as raw bytes before decoding, so multi-byte UTF-8
+        # characters split across frame boundaries are not corrupted.
+        $ms = New-Object System.IO.MemoryStream
+        $ms.Write($buff, 0, $r.Count)
         while (-not $r.EndOfMessage) {
-            $seg2 = [System.ArraySegment[byte]]::new($buff)
-            $rt = $script:ws.ReceiveAsync($seg2, [System.Threading.CancellationToken]::None)
+            $rt = $script:ws.ReceiveAsync($seg, [System.Threading.CancellationToken]::None)
             while (-not $rt.IsCompleted) { Start-Sleep -Milliseconds 100 }
-            $r2 = $rt.Result
-            $text += [System.Text.Encoding]::UTF8.GetString($buff, 0, $r2.Count)
+            if ($rt.Status -ne [System.Threading.Tasks.TaskStatus]::RanToCompletion) { return $null }
+            $r = $rt.Result
+            if ($r.MessageType -eq [System.Net.WebSockets.WebSocketMessageType]::Close) { return $null }
+            $ms.Write($buff, 0, $r.Count)
         }
-        return $text
+        return [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
     } catch { return $null }
 }
 
@@ -240,12 +300,14 @@ function Disconnect-WS {
         if ($script:ws -and ($script:ws.State -eq [System.Net.WebSockets.WebSocketState]::Open -or
                 $script:ws.State -eq [System.Net.WebSockets.WebSocketState]::CloseReceived)) {
             $task = $script:ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "", [System.Threading.CancellationToken]::None)
-            Wait-Task $task -TimeoutSeconds 2
+            [void](Wait-Task $task -TimeoutSeconds 2)
         }
     } catch { }
+    if ($script:ws) { try { $script:ws.Dispose() } catch { } }
     $script:ws = $null
     $script:activeConnectionId = 0; $script:myClientId = 0; $script:myChannelId = 0
-    $script:channelClients.Clear(); $script:cachedClientInfos.Clear(); $script:cachedChannelInfos.Clear(); $script:connectionsCache.Clear()
+    $script:channelClients.Clear(); $script:connectionsCache.Clear()
+    $script:cachedClientInfos = @{}; $script:cachedChannelInfos = @{}
     $script:lastTalkConn = 0
     if (-not $DontWriteState) { Write-DisconnectedState }
 }
@@ -270,30 +332,28 @@ function Copy-ActiveFromCache {
     $script:myClientId = $connData.clientId
 
     # Reset display state, then rebuild from the cached connection data.
-    $script:cachedClientInfos = @{}
+    # cachedClientInfos is the SAME hashtable as the connection's clientInfos
+    # (not a copy). A copy only got updated for moves involving our own
+    # channel, so after a user moved between two other channels the stale
+    # copy still placed them in their old channel — and they showed up in our
+    # list once we joined that channel.
+    $script:cachedClientInfos = $connData.clientInfos
     $script:channelClients.Clear()
     $script:myChannelId = 0
     $script:myNickname = ""
     $script:channelName = ""
 
-    foreach ($entry in $connData.clientInfos.GetEnumerator()) {
-        $script:cachedClientInfos[$entry.Key] = @{
-            channelId=$entry.Value.channelId
-            nickname=$entry.Value.nickname
-            inputMuted=$entry.Value.inputMuted
-            outputMuted=$entry.Value.outputMuted
-        }
+    # Find our own client info.
+    if ($script:myClientId -and $connData.clientInfos.ContainsKey($script:myClientId)) {
+        $self = $connData.clientInfos[$script:myClientId]
+        $script:myChannelId = $self.channelId
+        $script:myNickname  = $self.nickname
     }
-    # Find our own client info from the caching pass above.
-    foreach ($entry in $connData.clientInfos.GetEnumerator()) {
-        if ($entry.Key -eq $script:myClientId) {
-            $script:myChannelId   = $entry.Value.channelId
-            $script:myNickname    = $entry.Value.nickname
-        }
-    }
-    # Populate channelClients from the cached infos for our channel.
+    # Populate channelClients for our channel. Without a known channel we
+    # must not match anything: channelId 0 is used for clients whose
+    # channel is unknown, and would otherwise pull in strangers.
     foreach ($entry in $script:cachedClientInfos.GetEnumerator()) {
-        if ($entry.Value.channelId -eq $script:myChannelId) {
+        if ($script:myChannelId -gt 0 -and $entry.Value.channelId -eq $script:myChannelId) {
             $im = if ($entry.Value.inputMuted -eq 1) { 1 } else { 0 }
             $om = if ($entry.Value.outputMuted -eq 1) { 1 } else { 0 }
             $script:channelClients[$entry.Key] = @{n=$entry.Value.nickname; t=0; im=$im; om=$om}
@@ -309,9 +369,10 @@ function Copy-ActiveFromCache {
     # Ensure we always appear in our own channel list.
     if ($script:myClientId -gt 0 -and -not $script:channelClients.ContainsKey($script:myClientId)) {
         $n = if ($script:myNickname) { $script:myNickname } else { "?" }
-        $script:channelClients[$script:myClientId] = @{n=$n; t=0; im=0; om=0}
+        $f = Get-CachedMuteFlags $connId $script:myClientId
+        $script:channelClients[$script:myClientId] = @{n=$n; t=0; im=$f.im; om=$f.om}
         if (-not $script:cachedClientInfos.ContainsKey($script:myClientId)) {
-            $script:cachedClientInfos[$script:myClientId] = @{channelId=$script:myChannelId; nickname=$n}
+            $script:cachedClientInfos[$script:myClientId] = @{channelId=$script:myChannelId; nickname=$n; inputMuted=$null; outputMuted=$null}
         }
     }
 }
@@ -340,7 +401,7 @@ function Switch-ActiveConnection {
     if (-not $script:connectionsCache.ContainsKey($NewConnId)) { return }
     $script:activeConnectionId = $NewConnId
     Copy-ActiveFromCache
-    Write-Log "Switched to connection $NewConnId — channel=''$script:channelName'' users=$($script:channelClients.Count)"
+    Write-Log "Switched to connection $NewConnId — channel='$script:channelName' users=$($script:channelClients.Count)"
     Write-DataFile
 }
 
@@ -352,15 +413,22 @@ function Handle-AuthMsg {
     Write-Log "Auth response received"
 
     # Persist the apiKey if the server sent one (future connections use it).
-    $script:apiKey = Get-JsonValue $data "payload.apiKey"
-    if (-not $script:apiKey) { $script:apiKey = Get-JsonValue $data "apiKey" }
-    if ($script:apiKey) { Write-Key $script:apiKey }
+    # Only replace the stored key when the response actually contains one;
+    # otherwise the next reconnect would authenticate with an empty key and
+    # TS6 would ask for permission again.
+    $newKey = Get-JsonValue $data "payload.apiKey"
+    if (-not $newKey) { $newKey = Get-JsonValue $data "apiKey" }
+    if ($newKey -and $newKey -ne $script:apiKey) {
+        $script:apiKey = $newKey
+        Write-Key $script:apiKey
+    }
 
     $connections = Get-JsonValue $data "payload.connections"
     if (-not $connections) { $connections = Get-JsonValue $data "connections" }
 
     $script:connectionsCache.Clear()
     $script:channelClients.Clear()
+    $script:cachedClientInfos = @{}; $script:cachedChannelInfos = @{}
     $script:channelName = ""
     $script:pendingRefresh = $false
 
@@ -385,8 +453,14 @@ function Handle-AuthMsg {
             if ($clientInfos) {
                 foreach ($ci in $clientInfos) {
                     $n  = Sanitize-Name (Get-JsonValue $ci "properties.nickname")
-                    $connData.clientInfos[$ci.id] = @{channelId=$ci.channelId; nickname=$n}
-                    if ($ci.id -eq $selfId) { $ciFound = $true }
+                    $mute = Get-PropsMuteStatus (Get-JsonValue $ci "properties")
+                    $connData.clientInfos[$ci.id] = @{channelId=$ci.channelId; nickname=$n; inputMuted=$mute.im; outputMuted=$mute.om}
+                    if ($ci.id -eq $selfId) {
+                        $ciFound = $true
+                        $hw = Get-JsonValue $ci "properties.inputHardware"
+                        if ($null -eq $hw) { $hw = Get-JsonValue $ci "properties.input_hardware" }
+                        if ($null -ne $hw) { $connData.inputHardware = $hw }
+                    }
                 }
             }
 
@@ -437,11 +511,11 @@ function Handle-AuthMsg {
         # request a skin refresh so the Lua side re-reads fresh data.
         if ($script:authDone -and $script:channelClients.Count -eq 0) {
             $script:activeConnectionId = 0
-            try { "REFRESH|0`n"| Out-File $dataFile -Encoding utf8NoBOM } catch { }
+            Write-RefreshSignal
             return
         }
 
-        Write-Log "Auth OK — conn=$($script:activeConnectionId) channel=''$script:channelName'' users=$($script:channelClients.Count)"
+        Write-Log "Auth OK — conn=$($script:activeConnectionId) channel='$script:channelName' users=$($script:channelClients.Count)"
         Write-DataFile
         $script:authDone = $true
         return
@@ -456,7 +530,7 @@ function Handle-AuthMsg {
     } elseif ($script:channelName -eq '') {
         Write-Log "Auth OK (reconnect) — no connections, requesting refresh"
         $script:activeConnectionId = 0
-        try { "REFRESH|0`n"| Out-File $dataFile -Encoding utf8NoBOM } catch { }
+        Write-RefreshSignal
     }
 }
 
@@ -501,7 +575,7 @@ function Handle-ClientMoved {
     if ($script:connectionsCache.ContainsKey($connId)) {
         $connData = $script:connectionsCache[$connId]
         if (-not $connData.clientInfos.ContainsKey($cid)) {
-            $connData.clientInfos[$cid] = @{channelId=$newChan; nickname=$nick; inputMuted=$null}
+            $connData.clientInfos[$cid] = @{channelId=$newChan; nickname=$nick; inputMuted=$null; outputMuted=$null}
         } else {
             $connData.clientInfos[$cid].channelId = $newChan
             if ($nick -and $nick -ne '?') { $connData.clientInfos[$cid].nickname = $nick }
@@ -509,6 +583,10 @@ function Handle-ClientMoved {
                 $nick = $connData.clientInfos[$cid].nickname
             }
         }
+        # Some clientMoved events carry the client's properties (incl. mute state).
+        $mute = Get-PropsMuteStatus (Get-JsonValue $p "properties")
+        if ($null -ne $mute.im) { $connData.clientInfos[$cid].inputMuted = $mute.im }
+        if ($null -ne $mute.om) { $connData.clientInfos[$cid].outputMuted = $mute.om }
     }
 
     # Ignore events from non-active connections for display purposes.
@@ -529,12 +607,14 @@ function Handle-ClientMoved {
             }
             foreach ($entry in $script:cachedClientInfos.GetEnumerator()) {
                 if ($entry.Value.channelId -eq $newChan) {
-                    $script:channelClients[$entry.Key] = @{n=$entry.Value.nickname; t=0; im=0; om=0}
+                    $f = Get-CachedMuteFlags $connId $entry.Key
+                    $script:channelClients[$entry.Key] = @{n=$entry.Value.nickname; t=0; im=$f.im; om=$f.om}
                 }
             }
             if (-not $script:channelClients.ContainsKey($cid)) {
                 $n = if ($script:myNickname -and $script:myNickname -ne '?') { $script:myNickname } else { $nick }
-                $script:channelClients[$cid] = @{n=$n; t=0; im=0; om=0}
+                $f = Get-CachedMuteFlags $connId $cid
+                $script:channelClients[$cid] = @{n=$n; t=0; im=$f.im; om=$f.om}
             }
             Write-Log "Moved to $script:channelName ($newChan) — $($script:channelClients.Count) users"
             Write-DataFile
@@ -569,7 +649,8 @@ function Handle-ClientMoved {
         if ($nick -eq '?' -and $script:cachedClientInfos.ContainsKey($cid)) {
             $nick = $script:cachedClientInfos[$cid].nickname
         }
-        $script:channelClients[$cid] = @{n=$nick; t=0; im=0; om=0}
+        $f = Get-CachedMuteFlags $connId $cid
+        $script:channelClients[$cid] = @{n=$nick; t=0; im=$f.im; om=$f.om}
         if ($script:cachedClientInfos.ContainsKey($cid)) {
             $script:cachedClientInfos[$cid].channelId = $newChan
             $script:cachedClientInfos[$cid].nickname  = $nick
@@ -609,9 +690,9 @@ function Handle-ConnectStatus {
                 # First server connection after auth -> refresh for client infos.
                 $script:activeConnectionId = $connId
                 $script:myClientId = $clientId
-                try { "REFRESH|0`n"| Out-File $dataFile -Encoding utf8NoBOM } catch { }
+                Write-RefreshSignal
             } elseif ($script:selfDisconnected) {
-                try { "REFRESH|0`n"| Out-File $dataFile -Encoding utf8NoBOM } catch { }
+                Write-RefreshSignal
                 $script:selfDisconnected = $false
             } elseif ($connId -ne $oldConnId) {
                 # A secondary connection came online. Switch if we have cached data.
@@ -620,8 +701,30 @@ function Handle-ConnectStatus {
                 }
             }
         }
-    } elseif ($status -eq 0 -and $connId -eq $script:activeConnectionId) {
-        Write-DisconnectedState
+    } elseif ($status -eq 0 -and $connId -gt 0) {
+        # Drop the dead connection so its stale data is never shown again.
+        if ($script:connectionsCache.ContainsKey($connId)) { $script:connectionsCache.Remove($connId) }
+        if ($connId -ne $script:activeConnectionId) { return }
+
+        # The active connection went away. Fall back to another live
+        # connection (preferring the one with the mic), otherwise reset so the
+        # next status-4 event triggers a refresh instead of being ignored.
+        $script:activeConnectionId = 0
+        $script:myClientId = 0; $script:myChannelId = 0
+        $script:channelName = ""
+        $script:channelClients.Clear()
+        $script:cachedClientInfos = @{}; $script:cachedChannelInfos = @{}
+        $fallback = 0
+        foreach ($entry in $script:connectionsCache.GetEnumerator()) {
+            if ($fallback -eq 0 -or $entry.Value.inputHardware -eq $false) { $fallback = $entry.Key }
+        }
+        if ($fallback -gt 0) {
+            Write-Log "Connection $connId closed — switching to conn $fallback"
+            Switch-ActiveConnection $fallback
+        } else {
+            Write-Log "Connection $connId closed"
+            Write-DisconnectedState
+        }
     }
 }
 
@@ -632,6 +735,10 @@ function Handle-SelfPropUpdate {
     $connId = Get-JsonValue $data "payload.connectionId"
     $props  = Get-JsonValue $data "payload.properties"
     if (-not $props -or -not $connId) { return }
+    # Self-property events may omit clientId; it is always our own client.
+    if (-not $cid -and $script:connectionsCache.ContainsKey($connId)) {
+        $cid = $script:connectionsCache[$connId].clientId
+    }
 
     # Nickname update.
     $nick = Get-JsonValue $props "nickname"
@@ -681,9 +788,16 @@ function Handle-SelfPropUpdate {
 
     # Mute status for self.
     $mute = Get-PropsMuteStatus $props
+    if ($script:connectionsCache.ContainsKey($connId) -and $script:connectionsCache[$connId].clientInfos.ContainsKey($cid)) {
+        $info = $script:connectionsCache[$connId].clientInfos[$cid]
+        if ($null -ne $mute.im) { $info.inputMuted = $mute.im }
+        if ($null -ne $mute.om) { $info.outputMuted = $mute.om }
+    }
     if ($connId -eq $script:activeConnectionId -and $script:channelClients.ContainsKey($cid)) {
-        if ($null -ne $mute.im) { $script:channelClients[$cid].im = $mute.im; Write-DataFile }
-        if ($null -ne $mute.om) { $script:channelClients[$cid].om = $mute.om; Write-DataFile }
+        $changed = $false
+        if ($null -ne $mute.im) { $script:channelClients[$cid].im = $mute.im; $changed = $true }
+        if ($null -ne $mute.om) { $script:channelClients[$cid].om = $mute.om; $changed = $true }
+        if ($changed) { Write-DataFile }
     }
 }
 
@@ -709,11 +823,15 @@ function Handle-ClientProps {
         if ($null -ne $mute.im) { $connData.clientInfos[$cid].inputMuted = $mute.im }
         if ($null -ne $mute.om) { $connData.clientInfos[$cid].outputMuted = $mute.om }
 
-        $active = Get-JsonValue $props "inputHardware"
-        if ($null -eq $active) { $active = Get-JsonValue $props "input_hardware" }
-        if ($null -ne $active) {
-            $connData.inputHardware = $active
-            Sync-ActiveConnection
+        # inputHardware describes the connection only when it is OUR client's
+        # property; other users' values must not flip the active connection.
+        if ($cid -eq $connData.clientId) {
+            $active = Get-JsonValue $props "inputHardware"
+            if ($null -eq $active) { $active = Get-JsonValue $props "input_hardware" }
+            if ($null -ne $active) {
+                $connData.inputHardware = $active
+                Sync-ActiveConnection
+            }
         }
     }
 
@@ -735,8 +853,13 @@ function Handle-ClientProps {
     $sanitized = Sanitize-Name $nick
     if ($script:channelClients.ContainsKey($cid)) {
         $script:channelClients[$cid].n = $sanitized
-    } elseif ($sanitized -and $sanitized -ne '?') {
-        $script:channelClients[$cid] = @{n=$sanitized; t=0; im=0; om=0}
+    } elseif ($sanitized -and $sanitized -ne '?' -and $script:myChannelId -gt 0 -and
+              $script:cachedClientInfos.ContainsKey($cid) -and
+              $script:cachedClientInfos[$cid].channelId -eq $script:myChannelId) {
+        # Only add clients that are actually in our channel — previously any
+        # nickname change anywhere on the server added that user to the overlay.
+        $f = Get-CachedMuteFlags $connId $cid
+        $script:channelClients[$cid] = @{n=$sanitized; t=0; im=$f.im; om=$f.om}
     }
     if ($script:cachedClientInfos.ContainsKey($cid)) { $script:cachedClientInfos[$cid].nickname = $sanitized }
     if ($cid -eq $script:myClientId) { $script:myNickname = $sanitized }
@@ -769,7 +892,7 @@ while ($true) {
         }
     } | ConvertTo-Json -Compress
 
-    if (-not (Send-WS $auth)) { Write-Log "Auth send failed"; Disconnect-WS; continue }
+    if (-not (Send-WS $auth)) { Write-Log "Auth send failed"; Disconnect-WS; Start-Sleep -Seconds $reconnectDelay; continue }
     Write-Log "Auth sent — check TS6 notifications for permission request"
     Write-Log "Listening..."
 

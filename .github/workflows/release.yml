@@ -25,7 +25,7 @@ jobs:
       - name: Prepare package structure
         run: |
           mkdir -p _package/Skins/rainyTS
-          cp -r @Resources TS6Skin.ini Start-rainyTS.cmd README.md _package/Skins/rainyTS/
+          cp -r @Resources TS6Skin.ini Start-rainyTS.cmd README.md LICENSE _package/Skins/rainyTS/
           cat > _package/RMSKIN.ini <<EOF
           [rmskin]
           Name=rainyTS
